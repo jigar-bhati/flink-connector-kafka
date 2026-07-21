@@ -21,10 +21,13 @@ package org.apache.flink.connector.kafka.source.enumerator;
 import org.apache.flink.connector.base.source.utils.SerdeUtils;
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplitSerializer;
+import org.apache.flink.core.io.SimpleVersionedSerializer;
 
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
+import java.io.ByteArrayOutputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.util.Collection;
 import java.util.HashMap;
@@ -42,6 +45,8 @@ class KafkaSourceEnumStateSerializerTest {
     private static final int NUM_READERS = 10;
     private static final String TOPIC_PREFIX = "topic-";
     private static final int NUM_PARTITIONS_PER_TOPIC = 10;
+    private static final SimpleVersionedSerializer<KafkaPartitionSplit> SPLIT_SERIALIZER_V0 =
+            new KafkaPartitionSplitSerializerV0();
 
     @Test
     void testEnumStateSerde() throws IOException {
@@ -80,12 +85,14 @@ class KafkaSourceEnumStateSerializerTest {
 
         // Create bytes in the way of KafkaEnumStateSerializer version 0 doing serialization
         final byte[] bytesV0 =
-                SerdeUtils.serializeSplitAssignments(
-                        splitAssignments, new KafkaPartitionSplitSerializer());
+                SerdeUtils.serializeSplitAssignments(splitAssignments, SPLIT_SERIALIZER_V0);
         // Create bytes in the way of KafkaEnumStateSerializer version 1 doing serialization
         final byte[] bytesV1 = KafkaSourceEnumStateSerializer.serializeV1(splits);
         final byte[] bytesV2 =
                 KafkaSourceEnumStateSerializer.serializeV2(splitAndAssignmentStatuses, false);
+        // Version 3 was the latest enumerator format before the split serializer changed.
+        final byte[] bytesV3WithSplitV0 =
+                serializeV3(splitAndAssignmentStatuses, false, SPLIT_SERIALIZER_V0);
 
         // Deserialize above bytes with KafkaEnumStateSerializer version 2 to check backward
         // compatibility
@@ -95,6 +102,8 @@ class KafkaSourceEnumStateSerializerTest {
                 new KafkaSourceEnumStateSerializer().deserialize(1, bytesV1);
         final KafkaSourceEnumState kafkaSourceEnumStateV2 =
                 new KafkaSourceEnumStateSerializer().deserialize(2, bytesV2);
+        final KafkaSourceEnumState kafkaSourceEnumStateV3WithSplitV0 =
+                new KafkaSourceEnumStateSerializer().deserialize(3, bytesV3WithSplitV0);
 
         assertThat(kafkaSourceEnumStateV0.assignedSplits())
                 .containsExactlyInAnyOrderElementsOf(splits);
@@ -120,6 +129,33 @@ class KafkaSourceEnumStateSerializerTest {
                 .containsExactlyInAnyOrderElementsOf(
                         splitsByStatus.get(AssignmentStatus.UNASSIGNED));
         assertThat(kafkaSourceEnumStateV2.initialDiscoveryFinished()).isFalse();
+
+        assertThat(kafkaSourceEnumStateV3WithSplitV0.assignedSplits())
+                .containsExactlyInAnyOrderElementsOf(splitsByStatus.get(AssignmentStatus.ASSIGNED));
+        assertThat(kafkaSourceEnumStateV3WithSplitV0.unassignedSplits())
+                .containsExactlyInAnyOrderElementsOf(
+                        splitsByStatus.get(AssignmentStatus.UNASSIGNED));
+        assertThat(kafkaSourceEnumStateV3WithSplitV0.initialDiscoveryFinished()).isFalse();
+    }
+
+    private static byte[] serializeV3(
+            Collection<SplitAndAssignmentStatus> splits,
+            boolean initialDiscoveryFinished,
+            SimpleVersionedSerializer<KafkaPartitionSplit> splitSerializer)
+            throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputStream(baos)) {
+            out.writeInt(splits.size());
+            out.writeInt(splitSerializer.getVersion());
+            for (SplitAndAssignmentStatus split : splits) {
+                byte[] splitBytes = splitSerializer.serialize(split.split());
+                out.writeInt(splitBytes.length);
+                out.write(splitBytes);
+                out.writeInt(split.assignmentStatus().getStatusCode());
+            }
+            out.writeBoolean(initialDiscoveryFinished);
+            return baos.toByteArray();
+        }
     }
 
     private static AssignmentStatus getAssignmentStatus(KafkaPartitionSplit split) {
@@ -160,5 +196,32 @@ class KafkaSourceEnumStateSerializerTest {
                     .add(split);
         }
         return splitAssignments;
+    }
+
+    private static class KafkaPartitionSplitSerializerV0
+            implements SimpleVersionedSerializer<KafkaPartitionSplit> {
+
+        @Override
+        public int getVersion() {
+            return 0;
+        }
+
+        @Override
+        public byte[] serialize(KafkaPartitionSplit split) throws IOException {
+            try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                    DataOutputStream out = new DataOutputStream(baos)) {
+                out.writeUTF(split.getTopic());
+                out.writeInt(split.getPartition());
+                out.writeLong(split.getStartingOffset());
+                out.writeLong(
+                        split.getStoppingOffset().orElse(KafkaPartitionSplit.NO_STOPPING_OFFSET));
+                return baos.toByteArray();
+            }
+        }
+
+        @Override
+        public KafkaPartitionSplit deserialize(int version, byte[] serialized) throws IOException {
+            return new KafkaPartitionSplitSerializer().deserialize(version, serialized);
+        }
     }
 }

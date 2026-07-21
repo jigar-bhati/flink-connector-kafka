@@ -382,9 +382,9 @@ public class KafkaSourceBuilder<OUT> {
      * created.
      *
      * <ul>
-     *   <li><code>auto.offset.reset.strategy</code> is overridden by {@link
-     *       OffsetsInitializer#getAutoOffsetResetStrategy()} for the starting offsets, which is by
-     *       default {@link OffsetsInitializer#earliest()}.
+     *   <li><code>auto.offset.reset</code> controls how restored or subsequently invalid offsets
+     *       are reset. Fresh splits use {@link OffsetsInitializer#getAutoOffsetResetStrategy()}.
+     *       Restored offsets default to no reset when this property is not configured.
      *   <li><code>partition.discovery.interval.ms</code> is overridden to -1 when {@link
      *       #setBounded(OffsetsInitializer)} has been invoked.
      * </ul>
@@ -406,9 +406,9 @@ public class KafkaSourceBuilder<OUT> {
      * created.
      *
      * <ul>
-     *   <li><code>auto.offset.reset.strategy</code> is overridden by {@link
-     *       OffsetsInitializer#getAutoOffsetResetStrategy()} for the starting offsets, which is by
-     *       default {@link OffsetsInitializer#earliest()}.
+     *   <li><code>auto.offset.reset</code> controls how restored or subsequently invalid offsets
+     *       are reset. Fresh splits use {@link OffsetsInitializer#getAutoOffsetResetStrategy()}.
+     *       Restored offsets default to no reset when this property is not configured.
      *   <li><code>partition.discovery.interval.ms</code> is overridden to -1 when {@link
      *       #setBounded(OffsetsInitializer)} has been invoked.
      *   <li><code>client.id</code> is overridden to the "client.id.prefix-RANDOM_LONG", or
@@ -468,11 +468,6 @@ public class KafkaSourceBuilder<OUT> {
             maybeOverride(KafkaSourceOptions.COMMIT_OFFSETS_ON_CHECKPOINT.key(), "false", false);
         }
         maybeOverride(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false", false);
-        maybeOverride(
-                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                startingOffsetsInitializer.getAutoOffsetResetStrategy().name().toLowerCase(),
-                true);
-
         // If the source is bounded, do not run periodic partition discovery.
         if (boundedness == Boundedness.BOUNDED) {
             maybeOverride(KafkaSourceOptions.PARTITION_DISCOVERY_INTERVAL_MS.key(), "-1", true);

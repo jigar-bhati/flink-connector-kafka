@@ -44,7 +44,8 @@ public class DynamicKafkaSourceSplit extends KafkaPartitionSplit {
         super(
                 kafkaPartitionSplit.getTopicPartition(),
                 kafkaPartitionSplit.getStartingOffset(),
-                kafkaPartitionSplit.getStoppingOffset().orElse(NO_STOPPING_OFFSET));
+                kafkaPartitionSplit.getStoppingOffset().orElse(NO_STOPPING_OFFSET),
+                kafkaPartitionSplit.getStartingOffsetResetStrategy().orElse(null));
         this.kafkaClusterId = kafkaClusterId;
         this.kafkaPartitionSplit = kafkaPartitionSplit;
         this.retainedUntilMs = retainedUntilMs;
@@ -82,6 +83,17 @@ public class DynamicKafkaSourceSplit extends KafkaPartitionSplit {
 
     public DynamicKafkaSourceSplit clearRetention() {
         return new DynamicKafkaSourceSplit(kafkaClusterId, kafkaPartitionSplit);
+    }
+
+    @Override
+    public DynamicKafkaSourceSplit withoutStartingOffsetResetStrategy() {
+        if (!getStartingOffsetResetStrategy().isPresent()) {
+            return this;
+        }
+        return new DynamicKafkaSourceSplit(
+                kafkaClusterId,
+                kafkaPartitionSplit.withoutStartingOffsetResetStrategy(),
+                retainedUntilMs);
     }
 
     @Override

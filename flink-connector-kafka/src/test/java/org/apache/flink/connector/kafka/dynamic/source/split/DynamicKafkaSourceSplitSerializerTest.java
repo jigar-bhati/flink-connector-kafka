@@ -19,8 +19,8 @@
 package org.apache.flink.connector.kafka.dynamic.source.split;
 
 import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
-import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplitSerializer;
 
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
 import org.junit.jupiter.api.Test;
 
@@ -42,11 +42,24 @@ public class DynamicKafkaSourceSplitSerializerTest {
         DynamicKafkaSourceSplit dynamicKafkaSourceSplit =
                 new DynamicKafkaSourceSplit(
                         "test-cluster",
-                        new KafkaPartitionSplit(new TopicPartition("test-topic", 3), 1));
+                        new KafkaPartitionSplit(
+                                new TopicPartition("test-topic", 3),
+                                1,
+                                KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                OffsetResetStrategy.EARLIEST));
         DynamicKafkaSourceSplit dynamicKafkaSourceSplitAfterSerde =
                 serializer.deserialize(
                         serializer.getVersion(), serializer.serialize(dynamicKafkaSourceSplit));
         assertEquals(dynamicKafkaSourceSplit, dynamicKafkaSourceSplitAfterSerde);
+        assertEquals(
+                OffsetResetStrategy.EARLIEST,
+                dynamicKafkaSourceSplitAfterSerde.getStartingOffsetResetStrategy().orElseThrow());
+        assertEquals(
+                OffsetResetStrategy.EARLIEST,
+                dynamicKafkaSourceSplitAfterSerde
+                        .getKafkaPartitionSplit()
+                        .getStartingOffsetResetStrategy()
+                        .orElseThrow());
     }
 
     @Test
@@ -78,16 +91,54 @@ public class DynamicKafkaSourceSplitSerializerTest {
                 dynamicKafkaSourceSplit);
     }
 
+    @Test
+    public void testDeserializeV2StateWithV0Split() throws IOException {
+        DynamicKafkaSourceSplitSerializer serializer = new DynamicKafkaSourceSplitSerializer();
+        DynamicKafkaSourceSplit dynamicKafkaSourceSplit =
+                serializer.deserialize(2, serializeV2StateWithV0Split());
+
+        assertEquals(
+                new DynamicKafkaSourceSplit(
+                        "test-cluster",
+                        new KafkaPartitionSplit(new TopicPartition("test-topic", 3), 1),
+                        123L),
+                dynamicKafkaSourceSplit);
+    }
+
     private static byte[] serializeV1State() throws IOException {
-        KafkaPartitionSplitSerializer kafkaPartitionSplitSerializer =
-                new KafkaPartitionSplitSerializer();
         KafkaPartitionSplit kafkaPartitionSplit =
                 new KafkaPartitionSplit(new TopicPartition("test-topic", 3), 1);
         try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
                 DataOutputStream out = new DataOutputStream(baos)) {
             out.writeUTF("test-cluster");
-            out.writeInt(kafkaPartitionSplitSerializer.getVersion());
-            out.write(kafkaPartitionSplitSerializer.serialize(kafkaPartitionSplit));
+            out.writeInt(0);
+            out.write(serializeKafkaPartitionSplitV0(kafkaPartitionSplit));
+            return baos.toByteArray();
+        }
+    }
+
+    private static byte[] serializeV2StateWithV0Split() throws IOException {
+        KafkaPartitionSplit kafkaPartitionSplit =
+                new KafkaPartitionSplit(new TopicPartition("test-topic", 3), 1);
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputStream(baos)) {
+            out.writeUTF("test-cluster");
+            out.writeBoolean(true);
+            out.writeLong(123L);
+            out.writeInt(0);
+            out.write(serializeKafkaPartitionSplitV0(kafkaPartitionSplit));
+            return baos.toByteArray();
+        }
+    }
+
+    private static byte[] serializeKafkaPartitionSplitV0(KafkaPartitionSplit split)
+            throws IOException {
+        try (ByteArrayOutputStream baos = new ByteArrayOutputStream();
+                DataOutputStream out = new DataOutputStream(baos)) {
+            out.writeUTF(split.getTopic());
+            out.writeInt(split.getPartition());
+            out.writeLong(split.getStartingOffset());
+            out.writeLong(split.getStoppingOffset().orElse(KafkaPartitionSplit.NO_STOPPING_OFFSET));
             return baos.toByteArray();
         }
     }

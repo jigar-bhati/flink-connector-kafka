@@ -36,11 +36,22 @@ import org.apache.flink.runtime.metrics.MetricNames;
 import org.apache.flink.runtime.metrics.groups.InternalSourceReaderMetricGroup;
 import org.apache.flink.runtime.metrics.groups.UnregisteredMetricGroups;
 
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.NoOffsetForPartitionException;
+import org.apache.kafka.clients.consumer.OffsetAndMetadata;
+import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.kafka.clients.producer.KafkaProducer;
+import org.apache.kafka.clients.producer.ProducerConfig;
+import org.apache.kafka.clients.producer.ProducerRecord;
 import org.apache.kafka.common.KafkaException;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
+import org.apache.kafka.common.serialization.ByteArraySerializer;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -64,6 +75,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.apache.flink.connector.kafka.testutils.KafkaSourceTestEnv.NUM_RECORDS_PER_PARTITION;
@@ -322,6 +334,235 @@ public class KafkaPartitionSplitReaderTest {
         assertThat(reader.consumer().position(partition)).isEqualTo(expectedOffset);
     }
 
+    @ParameterizedTest
+    @CsvSource({"EARLIEST, 0", "LATEST, 10"})
+    public void testUsingCommittedOffsetsWithSplitOffsetResetStrategy(
+            OffsetResetStrategy offsetResetStrategy, Long expectedOffset) {
+        final Properties props = new Properties();
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "using-committed-offset-from-split");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        final TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(
+                                new KafkaPartitionSplit(
+                                        partition,
+                                        KafkaPartitionSplit.COMMITTED_OFFSET,
+                                        KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                        offsetResetStrategy))));
+
+        assertThat(reader.consumer().position(partition)).isEqualTo(expectedOffset);
+    }
+
+    @ParameterizedTest
+    @CsvSource({"EARLIEST, 0", "LATEST, 10"})
+    public void testStaleCommittedOffsetUsesSplitOffsetResetStrategy(
+            OffsetResetStrategy offsetResetStrategy, long expectedOffset) {
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+        String groupId = "stale-committed-offset-" + offsetResetStrategy.name().toLowerCase();
+        commitOffset(groupId, partition, NUM_RECORDS_PER_PARTITION + 1L);
+
+        Properties props = new Properties();
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        props.setProperty(
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
+                offsetResetStrategy == OffsetResetStrategy.EARLIEST ? "latest" : "earliest");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(
+                                new KafkaPartitionSplit(
+                                        partition,
+                                        KafkaPartitionSplit.COMMITTED_OFFSET,
+                                        KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                        offsetResetStrategy))));
+
+        assertThat(reader.consumer().position(partition)).isEqualTo(expectedOffset);
+    }
+
+    @Test
+    public void testFreshCommittedOffsetNoneIgnoresConfiguredRecoveryStrategy() {
+        final Properties props = new Properties();
+        props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, "fresh-committed-offset-with-none");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        assertThatThrownBy(
+                        () ->
+                                reader.handleSplitsChanges(
+                                        new SplitsAddition<>(
+                                                Collections.singletonList(
+                                                        new KafkaPartitionSplit(
+                                                                partition,
+                                                                KafkaPartitionSplit
+                                                                        .COMMITTED_OFFSET,
+                                                                KafkaPartitionSplit
+                                                                        .NO_STOPPING_OFFSET,
+                                                                OffsetResetStrategy.NONE)))))
+                .isInstanceOf(NoOffsetForPartitionException.class);
+    }
+
+    @Test
+    public void testRestoredSpecifiedOffsetOutOfRangeDefaultsToNone() {
+        KafkaPartitionSplitReader reader =
+                createReader(
+                        new Properties(), UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(
+                                new KafkaPartitionSplit(
+                                        partition, NUM_RECORDS_PER_PARTITION + 1L))));
+
+        assertThatThrownBy(reader::fetch)
+                .isInstanceOf(OffsetOutOfRangeException.class)
+                .satisfies(
+                        error ->
+                                assertThat(
+                                                ((OffsetOutOfRangeException) error)
+                                                        .offsetOutOfRangePartitions())
+                                        .containsEntry(partition, NUM_RECORDS_PER_PARTITION + 1L));
+    }
+
+    @ParameterizedTest
+    @CsvSource({"EARLIEST, 0", "LATEST, 10"})
+    public void testSpecifiedOffsetOutOfRangeUsesSplitOffsetResetStrategy(
+            OffsetResetStrategy offsetResetStrategy, long expectedOffset) {
+        KafkaPartitionSplitReader reader =
+                createReader(
+                        new Properties(), UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(
+                                new KafkaPartitionSplit(
+                                        partition,
+                                        NUM_RECORDS_PER_PARTITION + 1L,
+                                        KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                        offsetResetStrategy))));
+
+        assertThat(reader.consumer().position(partition)).isEqualTo(expectedOffset);
+    }
+
+    @Test
+    public void testFreshSpecifiedOffsetNoneIgnoresConfiguredRecoveryStrategy() {
+        Properties props = new Properties();
+        props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "earliest");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        assertThatThrownBy(
+                        () ->
+                                reader.handleSplitsChanges(
+                                        new SplitsAddition<>(
+                                                Collections.singletonList(
+                                                        new KafkaPartitionSplit(
+                                                                partition,
+                                                                NUM_RECORDS_PER_PARTITION + 1L,
+                                                                KafkaPartitionSplit
+                                                                        .NO_STOPPING_OFFSET,
+                                                                OffsetResetStrategy.NONE)))))
+                .isInstanceOf(OffsetOutOfRangeException.class);
+    }
+
+    @Test
+    public void testFreshSpecifiedOffsetUsesLogEndUnderReadCommitted() throws Exception {
+        TopicPartition partition = new TopicPartition(TOPIC3, 0);
+        long initialEndOffset;
+        try (AdminClient adminClient = KafkaSourceTestEnv.getAdminClient()) {
+            initialEndOffset =
+                    adminClient
+                            .listOffsets(Collections.singletonMap(partition, OffsetSpec.latest()))
+                            .partitionResult(partition)
+                            .get()
+                            .offset();
+        }
+
+        Properties producerProps =
+                KafkaSourceTestEnv.getConsumerProperties(ByteArrayDeserializer.class);
+        producerProps.setProperty(
+                ProducerConfig.KEY_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        producerProps.setProperty(
+                ProducerConfig.VALUE_SERIALIZER_CLASS_CONFIG, ByteArraySerializer.class.getName());
+        producerProps.setProperty(
+                ProducerConfig.TRANSACTIONAL_ID_CONFIG, UUID.randomUUID().toString());
+
+        try (KafkaProducer<byte[], byte[]> producer = new KafkaProducer<>(producerProps)) {
+            producer.initTransactions();
+            producer.beginTransaction();
+            producer.send(new ProducerRecord<>(TOPIC3, 0, new byte[0], new byte[0])).get();
+            producer.flush();
+
+            Properties readerProps = new Properties();
+            readerProps.setProperty(
+                    ConsumerConfig.ISOLATION_LEVEL_CONFIG,
+                    org.apache.kafka.common.IsolationLevel.READ_COMMITTED.toString());
+            try (KafkaPartitionSplitReader reader =
+                    createReader(
+                            readerProps,
+                            UnregisteredMetricsGroup.createSourceReaderMetricGroup())) {
+                long requestedOffset = initialEndOffset + 1;
+                reader.handleSplitsChanges(
+                        new SplitsAddition<>(
+                                Collections.singletonList(
+                                        new KafkaPartitionSplit(
+                                                partition,
+                                                requestedOffset,
+                                                KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                                OffsetResetStrategy.NONE))));
+
+                assertThat(reader.consumer().position(partition)).isEqualTo(requestedOffset);
+            } finally {
+                producer.abortTransaction();
+            }
+        }
+    }
+
+    @ParameterizedTest
+    @CsvSource({"earliest, 1", "latest, 10"})
+    public void testRestoredSpecifiedOffsetUsesConfiguredRecoveryStrategy(
+            String offsetResetStrategy, long expectedOffset) throws IOException {
+        Properties props = new Properties();
+        props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, offsetResetStrategy);
+        props.setProperty(ConsumerConfig.MAX_POLL_RECORDS_CONFIG, "1");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(
+                                new KafkaPartitionSplit(
+                                        partition, NUM_RECORDS_PER_PARTITION + 1L))));
+
+        reader.fetch();
+        assertThat(reader.consumer().position(partition)).isEqualTo(expectedOffset);
+    }
+
+    @Test
+    public void testReaderAcceptsDurationRecoveryStrategy() {
+        Properties props = new Properties();
+        props.setProperty(ConsumerConfig.AUTO_OFFSET_RESET_CONFIG, "by_duration:P1D");
+        KafkaPartitionSplitReader reader =
+                createReader(props, UnregisteredMetricsGroup.createSourceReaderMetricGroup());
+        TopicPartition partition = new TopicPartition(TOPIC1, 0);
+
+        reader.handleSplitsChanges(
+                new SplitsAddition<>(
+                        Collections.singletonList(new KafkaPartitionSplit(partition, 0L))));
+
+        assertThat(reader.consumer().position(partition)).isEqualTo(0L);
+    }
+
     @Test
     public void testConsumerClientRackSupplier() {
         String rackId = "use1-az1";
@@ -461,6 +702,15 @@ public class KafkaPartitionSplitReaderTest {
                 new TestingReaderContext(new Configuration(), sourceReaderMetricGroup),
                 kafkaSourceReaderMetrics,
                 rackId);
+    }
+
+    private void commitOffset(String groupId, TopicPartition partition, long offset) {
+        Properties props = KafkaSourceTestEnv.getConsumerProperties(ByteArrayDeserializer.class);
+        props.setProperty(ConsumerConfig.GROUP_ID_CONFIG, groupId);
+        try (KafkaConsumer<byte[], byte[]> consumer = new KafkaConsumer<>(props)) {
+            consumer.assign(Collections.singleton(partition));
+            consumer.commitSync(Collections.singletonMap(partition, new OffsetAndMetadata(offset)));
+        }
     }
 
     private Map<String, KafkaPartitionSplit> assignSplits(

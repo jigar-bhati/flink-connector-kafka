@@ -22,7 +22,10 @@ import org.apache.flink.annotation.Internal;
 import org.apache.flink.api.connector.source.SourceSplit;
 import org.apache.flink.util.FlinkRuntimeException;
 
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
+
+import javax.annotation.Nullable;
 
 import java.util.Arrays;
 import java.util.HashSet;
@@ -55,16 +58,28 @@ public class KafkaPartitionSplit implements SourceSplit {
     private final TopicPartition tp;
     private final long startingOffset;
     private final long stoppingOffset;
+    // Present only while this is a newly initialized split. Checkpointed splits use the consumer's
+    // configured recovery policy instead.
+    @Nullable private final OffsetResetStrategy startingOffsetResetStrategy;
 
     public KafkaPartitionSplit(TopicPartition tp, long startingOffset) {
         this(tp, startingOffset, NO_STOPPING_OFFSET);
     }
 
     public KafkaPartitionSplit(TopicPartition tp, long startingOffset, long stoppingOffset) {
+        this(tp, startingOffset, stoppingOffset, null);
+    }
+
+    public KafkaPartitionSplit(
+            TopicPartition tp,
+            long startingOffset,
+            long stoppingOffset,
+            @Nullable OffsetResetStrategy startingOffsetResetStrategy) {
         verifyInitialOffset(tp, startingOffset, stoppingOffset);
         this.tp = tp;
         this.startingOffset = startingOffset;
         this.stoppingOffset = stoppingOffset;
+        this.startingOffsetResetStrategy = startingOffsetResetStrategy;
     }
 
     public String getTopic() {
@@ -83,6 +98,23 @@ public class KafkaPartitionSplit implements SourceSplit {
         return startingOffset;
     }
 
+    public Optional<OffsetResetStrategy> getStartingOffsetResetStrategy() {
+        return Optional.ofNullable(startingOffsetResetStrategy);
+    }
+
+    /**
+     * Returns a copy without the startup-only offset reset strategy.
+     *
+     * <p>The startup strategy must not be retained in checkpoint state because restored offsets use
+     * the consumer's configured {@code auto.offset.reset} policy.
+     */
+    public KafkaPartitionSplit withoutStartingOffsetResetStrategy() {
+        if (startingOffsetResetStrategy == null) {
+            return this;
+        }
+        return new KafkaPartitionSplit(tp, startingOffset, stoppingOffset);
+    }
+
     public Optional<Long> getStoppingOffset() {
         return stoppingOffset >= 0
                         || stoppingOffset == LATEST_OFFSET
@@ -99,13 +131,16 @@ public class KafkaPartitionSplit implements SourceSplit {
     @Override
     public String toString() {
         return String.format(
-                "[Partition: %s, StartingOffset: %d, StoppingOffset: %d]",
-                tp, startingOffset, stoppingOffset);
+                "[Partition: %s, StartingOffset: %d, StoppingOffset: %d, StartingOffsetResetStrategy: %s]",
+                tp,
+                startingOffset,
+                stoppingOffset,
+                getStartingOffsetResetStrategy().map(Enum::name).orElse("not-set"));
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(tp, startingOffset, stoppingOffset);
+        return Objects.hash(tp, startingOffset, stoppingOffset, startingOffsetResetStrategy);
     }
 
     @Override
@@ -116,7 +151,8 @@ public class KafkaPartitionSplit implements SourceSplit {
         KafkaPartitionSplit other = (KafkaPartitionSplit) obj;
         return tp.equals(other.tp)
                 && startingOffset == other.startingOffset
-                && stoppingOffset == other.stoppingOffset;
+                && stoppingOffset == other.stoppingOffset
+                && startingOffsetResetStrategy == other.startingOffsetResetStrategy;
     }
 
     public static String toSplitId(TopicPartition tp) {

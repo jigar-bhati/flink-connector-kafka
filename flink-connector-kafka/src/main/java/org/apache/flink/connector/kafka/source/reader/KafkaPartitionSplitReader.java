@@ -31,12 +31,20 @@ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
 import org.apache.flink.util.FlinkRuntimeException;
 import org.apache.flink.util.Preconditions;
 
+import org.apache.kafka.clients.admin.AdminClient;
+import org.apache.kafka.clients.admin.ListOffsetsOptions;
+import org.apache.kafka.clients.admin.ListOffsetsResult;
+import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.apache.kafka.clients.consumer.ConsumerRecords;
 import org.apache.kafka.clients.consumer.KafkaConsumer;
+import org.apache.kafka.clients.consumer.NoOffsetForPartitionException;
 import org.apache.kafka.clients.consumer.OffsetAndMetadata;
 import org.apache.kafka.clients.consumer.OffsetCommitCallback;
+import org.apache.kafka.clients.consumer.OffsetOutOfRangeException;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
+import org.apache.kafka.common.IsolationLevel;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.errors.WakeupException;
 import org.slf4j.Logger;
@@ -48,6 +56,7 @@ import java.io.IOException;
 import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.HashSet;
 import java.util.Iterator;
@@ -56,6 +65,7 @@ import java.util.Map;
 import java.util.Properties;
 import java.util.Set;
 import java.util.StringJoiner;
+import java.util.concurrent.ExecutionException;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -67,6 +77,8 @@ public class KafkaPartitionSplitReader
     private static final long POLL_TIMEOUT = 10000L;
 
     private final KafkaConsumer<byte[], byte[]> consumer;
+    private final @Nullable Properties offsetValidationAdminClientProps;
+    private @Nullable AdminClient offsetValidationAdminClient;
     private final Map<TopicPartition, Long> stoppingOffsets;
     private final String groupId;
     private final int subtaskId;
@@ -92,9 +104,24 @@ public class KafkaPartitionSplitReader
         this.kafkaSourceReaderMetrics = kafkaSourceReaderMetrics;
         Properties consumerProps = new Properties();
         consumerProps.putAll(props);
+        consumerProps.putIfAbsent(
+                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
+                OffsetResetStrategy.NONE.name().toLowerCase());
         consumerProps.setProperty(ConsumerConfig.CLIENT_ID_CONFIG, createConsumerClientId(props));
         setConsumerClientRack(consumerProps, rackIdSupplier);
         this.consumer = new KafkaConsumer<>(consumerProps);
+        if (IsolationLevel.READ_COMMITTED
+                .toString()
+                .equals(String.valueOf(consumerProps.get(ConsumerConfig.ISOLATION_LEVEL_CONFIG)))) {
+            this.offsetValidationAdminClientProps = new Properties();
+            this.offsetValidationAdminClientProps.putAll(consumerProps);
+            this.offsetValidationAdminClientProps.setProperty(
+                    ConsumerConfig.CLIENT_ID_CONFIG,
+                    consumerProps.getProperty(ConsumerConfig.CLIENT_ID_CONFIG)
+                            + "-offset-validator");
+        } else {
+            this.offsetValidationAdminClientProps = null;
+        }
         this.stoppingOffsets = new HashMap<>();
         this.groupId = consumerProps.getProperty(ConsumerConfig.GROUP_ID_CONFIG);
 
@@ -185,6 +212,10 @@ public class KafkaPartitionSplitReader
         List<TopicPartition> newPartitionAssignments = new ArrayList<>();
         // Starting offsets.
         Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets = new HashMap<>();
+        Map<TopicPartition, OffsetResetStrategy> freshSpecifiedOffsetResetStrategies =
+                new HashMap<>();
+        Map<TopicPartition, OffsetResetStrategy> freshCommittedOffsetResetStrategies =
+                new HashMap<>();
         List<TopicPartition> partitionsStartingFromEarliest = new ArrayList<>();
         List<TopicPartition> partitionsStartingFromLatest = new ArrayList<>();
         // Stopping offsets.
@@ -201,7 +232,9 @@ public class KafkaPartitionSplitReader
                                     s,
                                     partitionsStartingFromEarliest,
                                     partitionsStartingFromLatest,
-                                    partitionsStartingFromSpecifiedOffsets);
+                                    freshCommittedOffsetResetStrategies,
+                                    partitionsStartingFromSpecifiedOffsets,
+                                    freshSpecifiedOffsetResetStrategies);
                             parseStoppingOffsets(
                                     s, partitionsStoppingAtLatest, partitionsStoppingAtCommitted);
                             // Track the new topic partition in metrics
@@ -216,7 +249,9 @@ public class KafkaPartitionSplitReader
         seekToStartingOffsets(
                 partitionsStartingFromEarliest,
                 partitionsStartingFromLatest,
-                partitionsStartingFromSpecifiedOffsets);
+                freshCommittedOffsetResetStrategies,
+                partitionsStartingFromSpecifiedOffsets,
+                freshSpecifiedOffsetResetStrategies);
         // Setup the stopping offsets.
         acquireAndSetStoppingOffsets(partitionsStoppingAtLatest, partitionsStoppingAtCommitted);
 
@@ -233,7 +268,13 @@ public class KafkaPartitionSplitReader
 
     @Override
     public void close() throws Exception {
-        consumer.close();
+        try {
+            consumer.close();
+        } finally {
+            if (offsetValidationAdminClient != null) {
+                offsetValidationAdminClient.close();
+            }
+        }
     }
 
     @Override
@@ -302,7 +343,9 @@ public class KafkaPartitionSplitReader
             KafkaPartitionSplit split,
             List<TopicPartition> partitionsStartingFromEarliest,
             List<TopicPartition> partitionsStartingFromLatest,
-            Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets) {
+            Map<TopicPartition, OffsetResetStrategy> freshCommittedOffsetResetStrategies,
+            Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets,
+            Map<TopicPartition, OffsetResetStrategy> freshSpecifiedOffsetResetStrategies) {
         TopicPartition tp = split.getTopicPartition();
         // Parse starting offsets.
         if (split.getStartingOffset() == KafkaPartitionSplit.EARLIEST_OFFSET) {
@@ -310,10 +353,16 @@ public class KafkaPartitionSplitReader
         } else if (split.getStartingOffset() == KafkaPartitionSplit.LATEST_OFFSET) {
             partitionsStartingFromLatest.add(tp);
         } else if (split.getStartingOffset() == KafkaPartitionSplit.COMMITTED_OFFSET) {
-            // Do nothing here, the consumer will first try to get the committed offsets of
-            // these partitions by default.
+            split.getStartingOffsetResetStrategy()
+                    .ifPresent(
+                            resetStrategy ->
+                                    freshCommittedOffsetResetStrategies.put(tp, resetStrategy));
         } else {
             partitionsStartingFromSpecifiedOffsets.put(tp, split.getStartingOffset());
+            split.getStartingOffsetResetStrategy()
+                    .ifPresent(
+                            resetStrategy ->
+                                    freshSpecifiedOffsetResetStrategies.put(tp, resetStrategy));
         }
     }
 
@@ -344,7 +393,9 @@ public class KafkaPartitionSplitReader
     private void seekToStartingOffsets(
             List<TopicPartition> partitionsStartingFromEarliest,
             List<TopicPartition> partitionsStartingFromLatest,
-            Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets) {
+            Map<TopicPartition, OffsetResetStrategy> freshCommittedOffsetResetStrategies,
+            Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets,
+            Map<TopicPartition, OffsetResetStrategy> freshSpecifiedOffsetResetStrategies) {
 
         if (!partitionsStartingFromEarliest.isEmpty()) {
             LOG.trace("Seeking starting offsets to beginning: {}", partitionsStartingFromEarliest);
@@ -356,11 +407,143 @@ public class KafkaPartitionSplitReader
             consumer.seekToEnd(partitionsStartingFromLatest);
         }
 
+        if (!freshCommittedOffsetResetStrategies.isEmpty()) {
+            LOG.trace(
+                    "Seeking starting offsets to committed offsets: {}",
+                    freshCommittedOffsetResetStrategies.keySet());
+            Map<TopicPartition, OffsetAndMetadata> committedOffsets =
+                    retryOnWakeup(
+                            () -> consumer.committed(freshCommittedOffsetResetStrategies.keySet()),
+                            "getting committed starting offsets");
+            Set<TopicPartition> missingOffsetsWithoutReset = new HashSet<>();
+            freshCommittedOffsetResetStrategies.forEach(
+                    (tp, resetStrategy) ->
+                            initializeFreshCommittedOffset(
+                                    tp,
+                                    resetStrategy,
+                                    committedOffsets.get(tp),
+                                    missingOffsetsWithoutReset,
+                                    partitionsStartingFromSpecifiedOffsets,
+                                    freshSpecifiedOffsetResetStrategies));
+            if (!missingOffsetsWithoutReset.isEmpty()) {
+                throw new NoOffsetForPartitionException(missingOffsetsWithoutReset);
+            }
+        }
+
         if (!partitionsStartingFromSpecifiedOffsets.isEmpty()) {
             LOG.trace(
                     "Seeking starting offsets to specified offsets: {}",
                     partitionsStartingFromSpecifiedOffsets);
             partitionsStartingFromSpecifiedOffsets.forEach(consumer::seek);
+        }
+        validateFreshSpecifiedOffsets(
+                partitionsStartingFromSpecifiedOffsets, freshSpecifiedOffsetResetStrategies);
+    }
+
+    private void initializeFreshCommittedOffset(
+            TopicPartition tp,
+            OffsetResetStrategy resetStrategy,
+            @Nullable OffsetAndMetadata committedOffset,
+            Set<TopicPartition> missingOffsetsWithoutReset,
+            Map<TopicPartition, Long> partitionsStartingFromSpecifiedOffsets,
+            Map<TopicPartition, OffsetResetStrategy> freshSpecifiedOffsetResetStrategies) {
+        if (committedOffset != null) {
+            partitionsStartingFromSpecifiedOffsets.put(tp, committedOffset.offset());
+            freshSpecifiedOffsetResetStrategies.put(tp, resetStrategy);
+            return;
+        }
+
+        switch (resetStrategy) {
+            case EARLIEST:
+                consumer.seekToBeginning(Collections.singleton(tp));
+                break;
+            case LATEST:
+                consumer.seekToEnd(Collections.singleton(tp));
+                break;
+            default:
+                missingOffsetsWithoutReset.add(tp);
+        }
+    }
+
+    private void validateFreshSpecifiedOffsets(
+            Map<TopicPartition, Long> specifiedOffsets,
+            Map<TopicPartition, OffsetResetStrategy> freshOffsetResetStrategies) {
+        if (freshOffsetResetStrategies.isEmpty()) {
+            return;
+        }
+
+        Set<TopicPartition> freshPartitions = freshOffsetResetStrategies.keySet();
+        Map<TopicPartition, Long> beginningOffsets =
+                retryOnWakeup(
+                        () -> consumer.beginningOffsets(freshPartitions),
+                        "getting beginning offsets for fresh splits");
+        Map<TopicPartition, Long> endOffsets = getFreshSplitEndOffsets(freshPartitions);
+        Map<TopicPartition, Long> offsetsWithoutReset = new HashMap<>();
+        List<TopicPartition> resetToEarliest = new ArrayList<>();
+        List<TopicPartition> resetToLatest = new ArrayList<>();
+
+        freshOffsetResetStrategies.forEach(
+                (tp, resetStrategy) -> {
+                    long requestedOffset = specifiedOffsets.get(tp);
+                    if (requestedOffset >= beginningOffsets.get(tp)
+                            && requestedOffset <= endOffsets.get(tp)) {
+                        return;
+                    }
+
+                    switch (resetStrategy) {
+                        case EARLIEST:
+                            resetToEarliest.add(tp);
+                            break;
+                        case LATEST:
+                            resetToLatest.add(tp);
+                            break;
+                        default:
+                            offsetsWithoutReset.put(tp, requestedOffset);
+                    }
+                });
+
+        if (!offsetsWithoutReset.isEmpty()) {
+            throw new OffsetOutOfRangeException(offsetsWithoutReset);
+        }
+        if (!resetToEarliest.isEmpty()) {
+            consumer.seekToBeginning(resetToEarliest);
+        }
+        if (!resetToLatest.isEmpty()) {
+            consumer.seekToEnd(resetToLatest);
+        }
+    }
+
+    private Map<TopicPartition, Long> getFreshSplitEndOffsets(Set<TopicPartition> freshPartitions) {
+        if (offsetValidationAdminClientProps == null) {
+            return retryOnWakeup(
+                    () -> consumer.endOffsets(freshPartitions),
+                    "getting end offsets for fresh splits");
+        }
+
+        if (offsetValidationAdminClient == null) {
+            offsetValidationAdminClient = AdminClient.create(offsetValidationAdminClientProps);
+        }
+        Map<TopicPartition, OffsetSpec> latestOffsets =
+                freshPartitions.stream()
+                        .collect(Collectors.toMap(tp -> tp, ignored -> OffsetSpec.latest()));
+        try {
+            Map<TopicPartition, ListOffsetsResult.ListOffsetsResultInfo> offsets =
+                    offsetValidationAdminClient
+                            .listOffsets(
+                                    latestOffsets,
+                                    new ListOffsetsOptions(IsolationLevel.READ_UNCOMMITTED))
+                            .all()
+                            .get();
+            return offsets.entrySet().stream()
+                    .collect(
+                            Collectors.toMap(
+                                    Map.Entry::getKey, entry -> entry.getValue().offset()));
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new FlinkRuntimeException(
+                    "Interrupted while getting end offsets for fresh splits", e);
+        } catch (ExecutionException e) {
+            throw new FlinkRuntimeException("Failed to get end offsets for fresh splits", e);
         }
     }
 

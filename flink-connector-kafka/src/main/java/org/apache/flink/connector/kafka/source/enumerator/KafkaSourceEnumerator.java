@@ -37,6 +37,7 @@ import org.apache.kafka.clients.admin.ListOffsetsResult;
 import org.apache.kafka.clients.admin.OffsetSpec;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.OffsetAndTimestamp;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -291,8 +292,18 @@ public class KafkaSourceEnumerator
 
     @Override
     public KafkaSourceEnumState snapshotState(long checkpointId) throws Exception {
+        if (checkpointId < 0) {
+            return new KafkaSourceEnumState(
+                    assignedSplits.values(), unassignedSplits.values(), initialDiscoveryFinished);
+        }
         return new KafkaSourceEnumState(
-                assignedSplits.values(), unassignedSplits.values(), initialDiscoveryFinished);
+                assignedSplits.values().stream()
+                        .map(KafkaPartitionSplit::withoutStartingOffsetResetStrategy)
+                        .collect(Collectors.toList()),
+                unassignedSplits.values().stream()
+                        .map(KafkaPartitionSplit::withoutStartingOffsetResetStrategy)
+                        .collect(Collectors.toList()),
+                initialDiscoveryFinished);
     }
 
     @Override
@@ -391,9 +402,21 @@ public class KafkaSourceEnumerator
             long startingOffset = tpAndStartingOffset.getValue();
             long stoppingOffset =
                     stoppingOffsets.getOrDefault(tp, KafkaPartitionSplit.NO_STOPPING_OFFSET);
-            partitionSplits.add(new KafkaPartitionSplit(tp, startingOffset, stoppingOffset));
+            partitionSplits.add(
+                    new KafkaPartitionSplit(
+                            tp,
+                            startingOffset,
+                            stoppingOffset,
+                            getStartingOffsetResetStrategy(tp, initialPartitions)));
         }
         return new PartitionSplitChange(partitionSplits, partitionChange.getRemovedPartitions());
+    }
+
+    private OffsetResetStrategy getStartingOffsetResetStrategy(
+            TopicPartition tp, Set<TopicPartition> initialPartitions) {
+        return initialPartitions.contains(tp)
+                ? startingOffsetInitializer.getAutoOffsetResetStrategy()
+                : newDiscoveryOffsetsInitializer.getAutoOffsetResetStrategy();
     }
 
     private void initOffsets(

@@ -431,8 +431,35 @@ public class KafkaSourceEnumeratorTest {
             // READER2 not yet assigned
             final Set<KafkaPartitionSplit> unassignedSplits =
                     enumerator.getPendingPartitionSplitAssignment().get(READER2);
-            assertThat(enumerator.snapshotState(1L).unassignedSplits())
-                    .containsExactlyInAnyOrderElementsOf(unassignedSplits);
+            assertThat(unassignedSplits)
+                    .allSatisfy(
+                            split ->
+                                    assertThat(split.getStartingOffsetResetStrategy())
+                                            .contains(
+                                                    offsetsInitializer
+                                                            .getOffsetsInitializer()
+                                                            .getAutoOffsetResetStrategy()));
+            Collection<KafkaPartitionSplit> internalRestartSplits =
+                    enumerator.snapshotState(-1L).unassignedSplits();
+            assertThat(internalRestartSplits).containsExactlyInAnyOrderElementsOf(unassignedSplits);
+            assertThat(internalRestartSplits)
+                    .allSatisfy(
+                            split ->
+                                    assertThat(split.getStartingOffsetResetStrategy())
+                                            .contains(
+                                                    offsetsInitializer
+                                                            .getOffsetsInitializer()
+                                                            .getAutoOffsetResetStrategy()));
+            Collection<KafkaPartitionSplit> checkpointedUnassignedSplits =
+                    enumerator.snapshotState(1L).unassignedSplits();
+            assertThat(checkpointedUnassignedSplits)
+                    .containsExactlyInAnyOrderElementsOf(
+                            unassignedSplits.stream()
+                                    .map(KafkaPartitionSplit::withoutStartingOffsetResetStrategy)
+                                    .collect(Collectors.toList()));
+            assertThat(checkpointedUnassignedSplits)
+                    .allSatisfy(
+                            split -> assertThat(split.getStartingOffsetResetStrategy()).isEmpty());
 
             // Simulate a reader failure.
             context.unregisterReader(READER0);
@@ -455,7 +482,8 @@ public class KafkaSourceEnumeratorTest {
             assertThat(state.unassignedSplits())
                     .containsExactlyInAnyOrderElementsOf(
                             Iterables.concat(
-                                    advancedSplits, unassignedSplits)); // READER0 + READER2
+                                    advancedSplits,
+                                    checkpointedUnassignedSplits)); // READER0 + READER2
             assertThat(state.assignedSplits()).doesNotContainAnyElementsOf(advancedSplits);
 
             // Simulate a reader recovery.
@@ -464,7 +492,7 @@ public class KafkaSourceEnumeratorTest {
                     Map.of(READER0, advancedSplits),
                     context.getSplitsAssignmentSequence().get(2).assignment());
             assertThat(enumerator.snapshotState(3L).unassignedSplits())
-                    .containsExactlyInAnyOrderElementsOf(unassignedSplits);
+                    .containsExactlyInAnyOrderElementsOf(checkpointedUnassignedSplits);
         }
     }
 
@@ -888,7 +916,10 @@ public class KafkaSourceEnumeratorTest {
     private static KafkaPartitionSplit createSplit(
             TopicPartition tp, OffsetsInitializer startingOffsetsInitializer) {
         return new KafkaPartitionSplit(
-                tp, startingOffsetsInitializer.getPartitionOffsets(List.of(tp), retriever).get(tp));
+                tp,
+                startingOffsetsInitializer.getPartitionOffsets(List.of(tp), retriever).get(tp),
+                KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                startingOffsetsInitializer.getAutoOffsetResetStrategy());
     }
 
     private void verifySplitAssignmentWithPartitions(
@@ -897,6 +928,7 @@ public class KafkaSourceEnumeratorTest {
         final Set<KafkaPartitionSplit> allTopicPartitionsFromAssignment =
                 expectedAssignment.values().stream()
                         .flatMap(Collection::stream)
+                        .map(KafkaPartitionSplit::withoutStartingOffsetResetStrategy)
                         .collect(Collectors.toSet());
         assertThat(actualTopicPartitions)
                 .containsExactlyInAnyOrderElementsOf(allTopicPartitionsFromAssignment);

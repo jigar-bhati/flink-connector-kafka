@@ -317,12 +317,11 @@ class KafkaSourceBuilder(object):
         Set an arbitrary property for the KafkaSource and KafkaConsumer. The valid keys can be found
         in ConsumerConfig and KafkaSourceOptions.
 
-        Note that the following keys will be overridden by the builder when the KafkaSource is
-        created.
+        Note the following KafkaSource behavior.
 
-        * ``auto.offset.reset.strategy`` is overridden by AutoOffsetResetStrategy returned by
-          :class:`KafkaOffsetsInitializer` for the starting offsets, which is by default
-          :meth:`KafkaOffsetsInitializer.earliest`.
+        * The reset strategy returned by :class:`KafkaOffsetsInitializer` controls unavailable
+          offsets while initializing fresh splits. ``auto.offset.reset`` controls restored or
+          subsequently invalid consumer offsets and defaults to ``none`` when it is not configured.
         * ``partition.discovery.interval.ms`` is overridden to -1 when :meth:`set_bounded` has been
           invoked.
 
@@ -338,12 +337,11 @@ class KafkaSourceBuilder(object):
         Set arbitrary properties for the KafkaSource and KafkaConsumer. The valid keys can be found
         in ConsumerConfig and KafkaSourceOptions.
 
-        Note that the following keys will be overridden by the builder when the KafkaSource is
-        created.
+        Note the following KafkaSource behavior.
 
-        * ``auto.offset.reset.strategy`` is overridden by AutoOffsetResetStrategy returned by
-          :class:`KafkaOffsetsInitializer` for the starting offsets, which is by default
-          :meth:`KafkaOffsetsInitializer.earliest`.
+        * The reset strategy returned by :class:`KafkaOffsetsInitializer` controls unavailable
+          offsets while initializing fresh splits. ``auto.offset.reset`` controls restored or
+          subsequently invalid consumer offsets and defaults to ``none`` when it is not configured.
         * ``partition.discovery.interval.ms`` is overridden to -1 when :meth:`set_bounded` has been
           invoked.
         * ``client.id`` is overridden to "client.id.prefix-RANDOM_LONG", or "group.id-RANDOM_LONG"

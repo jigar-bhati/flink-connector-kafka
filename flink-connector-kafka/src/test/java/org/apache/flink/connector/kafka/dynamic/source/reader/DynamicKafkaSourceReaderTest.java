@@ -51,6 +51,7 @@ import org.apache.flink.streaming.connectors.kafka.DynamicKafkaSourceTestHelper;
 import com.google.common.collect.ImmutableList;
 import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
 import org.apache.kafka.common.serialization.ByteArrayDeserializer;
 import org.apache.kafka.common.serialization.IntegerDeserializer;
@@ -180,6 +181,26 @@ public class DynamicKafkaSourceReaderTest extends SourceReaderTestBase<DynamicKa
             assertThat(activeSplitCountGauge.orElseThrow().getValue())
                     .as("reactivated retained splits become active again")
                     .isEqualTo(NUM_SPLITS_PER_CLUSTER);
+        }
+    }
+
+    @Test
+    void testCheckpointDropsStartingOffsetResetStrategyFromPendingSplits() throws Exception {
+        TestingReaderContext context = new TestingReaderContext();
+        try (DynamicKafkaSourceReader<Integer> reader = createReaderWithoutStart(context)) {
+            DynamicKafkaSourceSplit split =
+                    new DynamicKafkaSourceSplit(
+                            kafkaClusterId0,
+                            new KafkaPartitionSplit(
+                                    new TopicPartition(TOPIC, 0),
+                                    0,
+                                    KafkaPartitionSplit.NO_STOPPING_OFFSET,
+                                    OffsetResetStrategy.EARLIEST));
+            reader.addSplits(Collections.singletonList(split));
+
+            assertThat(reader.snapshotState(-1).get(0).getStartingOffsetResetStrategy())
+                    .contains(OffsetResetStrategy.EARLIEST);
+            assertThat(reader.snapshotState(1L).get(0).getStartingOffsetResetStrategy()).isEmpty();
         }
     }
 

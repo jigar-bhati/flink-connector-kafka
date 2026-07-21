@@ -223,7 +223,7 @@ CREATE TABLE KafkaTable (
       <td style="word-wrap: break-word;">（无）</td>
       <td>String</td>
       <td>
-         可以设置和传递任意 Kafka 的配置项。后缀名必须匹配在 <a href="https://kafka.apache.org/documentation/#configuration">Kafka 配置文档</a> 中定义的配置键。Flink 将移除 "properties." 配置键前缀并将变换后的配置键和值传入底层的 Kafka 客户端。例如，你可以通过 <code>'properties.allow.auto.create.topics' = 'false'</code> 来禁用 topic 的自动创建。但是某些配置项不支持进行配置，因为 Flink 会覆盖这些配置，例如 <code>'key.deserializer'</code> 和 <code>'value.deserializer'</code>。
+         可以设置和传递任意 Kafka 的配置项。后缀名必须匹配在 <a href="https://kafka.apache.org/documentation/#configuration">Kafka 配置文档</a> 中定义的配置键。Flink 将移除 "properties." 配置键前缀并将变换后的配置键和值传入底层的 Kafka 客户端。例如，你可以通过 <code>'properties.allow.auto.create.topics' = 'false'</code> 来禁用 topic 的自动创建。<code>'auto.offset.reset'</code> 属性用于处理从 checkpoint 恢复的 offset 或运行期间失效的 consumer offset。新 split 使用 <code>'scan.startup.mode'</code> 所对应的 fallback 策略；对于 <code>'group-offsets'</code>，当 committed offset 不可用时，该属性也提供启动 fallback 策略。如果未配置 <code>'auto.offset.reset'</code>，恢复的 offset 默认使用 <code>'none'</code>。但是某些配置项不支持进行配置，因为 Flink 会覆盖这些配置，例如 <code>'key.deserializer'</code> 和 <code>'value.deserializer'</code>。
       </td>
     </tr>
     <tr>

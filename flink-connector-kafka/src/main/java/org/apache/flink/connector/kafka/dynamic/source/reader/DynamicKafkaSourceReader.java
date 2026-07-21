@@ -37,7 +37,6 @@ import org.apache.flink.connector.kafka.dynamic.source.metrics.KafkaClusterMetri
 import org.apache.flink.connector.kafka.dynamic.source.metrics.KafkaClusterMetricGroupManager;
 import org.apache.flink.connector.kafka.dynamic.source.split.DynamicKafkaSourceSplit;
 import org.apache.flink.connector.kafka.source.KafkaPropertiesUtil;
-import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
 import org.apache.flink.connector.kafka.source.metrics.KafkaSourceReaderMetrics;
 import org.apache.flink.connector.kafka.source.reader.KafkaRecordEmitter;
 import org.apache.flink.connector.kafka.source.reader.KafkaSourceReader;
@@ -52,7 +51,6 @@ import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.UserCodeClassLoader;
 
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -284,16 +282,6 @@ public class DynamicKafkaSourceReader<T> implements SourceReader<T, DynamicKafka
                 Properties clusterProperties = new Properties();
                 KafkaPropertiesUtil.copyProperties(
                         clusterMetadataMapEntry.getValue().getProperties(), clusterProperties);
-                OffsetsInitializer startingOffsetsInitializer =
-                        clusterMetadataMapEntry.getValue().getStartingOffsetsInitializer();
-                if (startingOffsetsInitializer != null) {
-                    clusterProperties.setProperty(
-                            ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                            startingOffsetsInitializer
-                                    .getAutoOffsetResetStrategy()
-                                    .name()
-                                    .toLowerCase());
-                }
                 newClustersProperties.put(clusterMetadataMapEntry.getKey(), clusterProperties);
             }
         }
@@ -439,7 +427,12 @@ public class DynamicKafkaSourceReader<T> implements SourceReader<T, DynamicKafka
         // reader has started
         splits.addAll(retainedSplits);
         splits.addAll(pendingSplits);
-        return splits;
+        if (checkpointId < 0) {
+            return splits;
+        }
+        return splits.stream()
+                .map(DynamicKafkaSourceSplit::withoutStartingOffsetResetStrategy)
+                .collect(Collectors.toList());
     }
 
     private List<DynamicKafkaSourceSplit> snapshotStateFromAllReaders(long checkpointId) {

@@ -484,6 +484,19 @@ public class DynamicKafkaSourceEnumeratorTest {
                     .isEqualTo(
                             NUM_SPLITS_PER_CLUSTER
                                     * DynamicKafkaSourceTestHelper.NUM_KAFKA_CLUSTERS);
+            assertThat(
+                            stateAfterSplitAssignment.getClusterEnumeratorStates().values().stream()
+                                    .flatMap(enumState -> enumState.assignedSplits().stream()))
+                    .allSatisfy(
+                            split ->
+                                    assertThat(split.getStartingOffsetResetStrategy()).isPresent());
+
+            DynamicKafkaSourceEnumState checkpointState = enumerator.snapshotState(1L);
+            assertThat(
+                            checkpointState.getClusterEnumeratorStates().values().stream()
+                                    .flatMap(enumState -> enumState.assignedSplits().stream()))
+                    .allSatisfy(
+                            split -> assertThat(split.getStartingOffsetResetStrategy()).isEmpty());
         }
     }
 

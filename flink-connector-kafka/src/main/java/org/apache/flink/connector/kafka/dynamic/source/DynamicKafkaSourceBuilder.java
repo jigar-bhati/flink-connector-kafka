@@ -254,11 +254,6 @@ public class DynamicKafkaSourceBuilder<T> {
             maybeOverride(KafkaSourceOptions.COMMIT_OFFSETS_ON_CHECKPOINT.key(), "false", false);
         }
         maybeOverride(ConsumerConfig.ENABLE_AUTO_COMMIT_CONFIG, "false", false);
-        maybeOverride(
-                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                startingOffsetsInitializer.getAutoOffsetResetStrategy().name().toLowerCase(),
-                true);
-
         // If the source is bounded, do not run periodic partition discovery.
         maybeOverride(
                 KafkaSourceOptions.PARTITION_DISCOVERY_INTERVAL_MS.key(),

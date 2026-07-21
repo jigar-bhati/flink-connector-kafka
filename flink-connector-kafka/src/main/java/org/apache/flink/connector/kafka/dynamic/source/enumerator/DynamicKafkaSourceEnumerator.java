@@ -44,7 +44,6 @@ import org.apache.flink.connector.kafka.source.split.KafkaPartitionSplit;
 import org.apache.flink.util.Preconditions;
 
 import org.apache.kafka.clients.CommonClientConfigs;
-import org.apache.kafka.clients.consumer.ConsumerConfig;
 import org.apache.kafka.common.KafkaException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -615,13 +614,6 @@ public class DynamicKafkaSourceEnumerator
         KafkaPropertiesUtil.copyProperties(properties, consumerProps);
         DynamicKafkaSourceOptions.removeRemovedClusterRetentionOption(consumerProps);
         KafkaPropertiesUtil.setClientIdPrefix(consumerProps, kafkaClusterId);
-        consumerProps.setProperty(
-                ConsumerConfig.AUTO_OFFSET_RESET_CONFIG,
-                effectiveStartingOffsetsInitializer
-                        .getAutoOffsetResetStrategy()
-                        .name()
-                        .toLowerCase());
-
         KafkaSourceEnumerator enumerator =
                 new KafkaSourceEnumerator(
                         KafkaSubscriber.getTopicListSubscriber(new ArrayList<>(topics)),

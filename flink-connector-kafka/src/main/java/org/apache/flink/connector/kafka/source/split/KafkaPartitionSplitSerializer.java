@@ -21,6 +21,7 @@ package org.apache.flink.connector.kafka.source.split;
 import org.apache.flink.annotation.Internal;
 import org.apache.flink.core.io.SimpleVersionedSerializer;
 
+import org.apache.kafka.clients.consumer.OffsetResetStrategy;
 import org.apache.kafka.common.TopicPartition;
 
 import java.io.ByteArrayInputStream;
@@ -37,7 +38,7 @@ import java.io.IOException;
 public class KafkaPartitionSplitSerializer
         implements SimpleVersionedSerializer<KafkaPartitionSplit> {
 
-    private static final int CURRENT_VERSION = 0;
+    private static final int CURRENT_VERSION = 1;
 
     @Override
     public int getVersion() {
@@ -52,6 +53,10 @@ public class KafkaPartitionSplitSerializer
             out.writeInt(split.getPartition());
             out.writeLong(split.getStartingOffset());
             out.writeLong(split.getStoppingOffset().orElse(KafkaPartitionSplit.NO_STOPPING_OFFSET));
+            out.writeBoolean(split.getStartingOffsetResetStrategy().isPresent());
+            if (split.getStartingOffsetResetStrategy().isPresent()) {
+                out.writeUTF(split.getStartingOffsetResetStrategy().get().name());
+            }
             out.flush();
             return baos.toByteArray();
         }
@@ -59,14 +64,28 @@ public class KafkaPartitionSplitSerializer
 
     @Override
     public KafkaPartitionSplit deserialize(int version, byte[] serialized) throws IOException {
+        if (version < 0 || version > CURRENT_VERSION) {
+            throw new IOException(
+                    String.format(
+                            "The bytes are serialized with version %d, "
+                                    + "while this deserializer only supports version up to %d",
+                            version, CURRENT_VERSION));
+        }
         try (ByteArrayInputStream bais = new ByteArrayInputStream(serialized);
                 DataInputStream in = new DataInputStream(bais)) {
             String topic = in.readUTF();
             int partition = in.readInt();
             long offset = in.readLong();
             long stoppingOffset = in.readLong();
+            OffsetResetStrategy startingOffsetResetStrategy =
+                    version == 0
+                            ? null
+                            : in.readBoolean() ? OffsetResetStrategy.valueOf(in.readUTF()) : null;
             return new KafkaPartitionSplit(
-                    new TopicPartition(topic, partition), offset, stoppingOffset);
+                    new TopicPartition(topic, partition),
+                    offset,
+                    stoppingOffset,
+                    startingOffsetResetStrategy);
         }
     }
 }
